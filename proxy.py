@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
+import socket
 import socketserver
 import threading
 import time
@@ -38,6 +40,121 @@ from handler import get_key
 
 LOGGER = logging.getLogger("qkd004.proxy")
 
+PROTOBUF_STATUS_SUCCESS = 0
+PROTOBUF_STATUS_NO_QKD_CONNECTION = 4
+PROTOBUF_STATUS_TIMEOUT_ERROR = 6
+PROTOBUF_STATUS_METADATA_BUFFER_TOO_SMALL = 8
+
+
+def _pb_encode_varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("varint cannot encode negative values")
+    chunks = bytearray()
+    while True:
+        to_write = value & 0x7F
+        value >>= 7
+        if value:
+            chunks.append(to_write | 0x80)
+        else:
+            chunks.append(to_write)
+            break
+    return bytes(chunks)
+
+
+def _pb_decode_varint(data: bytes, offset: int = 0) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while offset < len(data):
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if (byte & 0x80) == 0:
+            return value, offset
+        shift += 7
+        if shift > 63:
+            raise ValueError("protobuf varint too long")
+    raise ValueError("truncated protobuf varint")
+
+
+def _pb_encode_field_varint(field_number: int, value: int) -> bytes:
+    key = (field_number << 3) | 0
+    return _pb_encode_varint(key) + _pb_encode_varint(value)
+
+
+def _pb_encode_field_bytes(field_number: int, value: bytes) -> bytes:
+    key = (field_number << 3) | 2
+    return _pb_encode_varint(key) + _pb_encode_varint(len(value)) + value
+
+
+def _pb_parse_message(data: bytes) -> dict[int, list[tuple[str, int | bytes]]]:
+    fields: dict[int, list[tuple[str, int | bytes]]] = {}
+    offset = 0
+
+    while offset < len(data):
+        key, offset = _pb_decode_varint(data, offset)
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if field_number <= 0:
+            raise ValueError("invalid protobuf field number")
+
+        if wire_type == 0:
+            value, offset = _pb_decode_varint(data, offset)
+            parsed_value: tuple[str, int | bytes] = ("varint", value)
+        elif wire_type == 2:
+            size, offset = _pb_decode_varint(data, offset)
+            end = offset + size
+            if end > len(data):
+                raise ValueError("truncated protobuf length-delimited field")
+            parsed_value = ("bytes", data[offset:end])
+            offset = end
+        else:
+            raise ValueError(f"unsupported protobuf wire type: {wire_type}")
+
+        fields.setdefault(field_number, []).append(parsed_value)
+
+    return fields
+
+
+def _pb_first_varint(
+    fields: dict[int, list[tuple[str, int | bytes]]],
+    field_number: int,
+    default: int = 0,
+) -> int:
+    for wire_type, value in fields.get(field_number, []):
+        if wire_type == "varint":
+            return int(value)
+    return default
+
+
+def _pb_first_bytes(
+    fields: dict[int, list[tuple[str, int | bytes]]],
+    field_number: int,
+    default: bytes = b"",
+) -> bytes:
+    for wire_type, value in fields.get(field_number, []):
+        if wire_type == "bytes":
+            return bytes(value)
+    return default
+
+
+def _pb_first_string(
+    fields: dict[int, list[tuple[str, int | bytes]]],
+    field_number: int,
+    default: str = "",
+) -> str:
+    raw = _pb_first_bytes(fields, field_number, b"")
+    if not raw:
+        return default
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return default
+
+
+def _looks_like_json_stream(data: bytes) -> bool:
+    probe = data.lstrip(b" \t\r\n")
+    return probe.startswith(b"{") or probe.startswith(b"[")
+
 
 @dataclass
 class Association:
@@ -51,6 +168,8 @@ class QKDProxyService:
     def __init__(self) -> None:
         self._associations: Dict[bytes, Association] = {}
         self._key_cache: Dict[bytes, bytes] = {}
+        self._protobuf_stream_pairs: Dict[bytes, tuple[str, str]] = {}
+        self._protobuf_key_cache: Dict[tuple[bytes, int, int], bytes] = {}
         self._lock = threading.Lock()
 
     def handle_raw_message(self, raw_message: str) -> str:
@@ -101,6 +220,216 @@ class QKDProxyService:
 
         response = self._dispatch(message)
         return encode_message(response)
+
+    def handle_raw_binary_message(self, raw_message: bytes) -> bytes:
+        try:
+            request = self._decode_protobuf_request(raw_message)
+        except Exception as exc:
+            return self._encode_protobuf_response(
+                status=PROTOBUF_STATUS_METADATA_BUFFER_TOO_SMALL,
+                detail=f"invalid protobuf payload: {exc}",
+            )
+
+        kind = request["kind"]
+        if kind == "close":
+            stream_id = request.get("stream_id", b"")
+            if not stream_id:
+                return self._encode_protobuf_response(
+                    status=PROTOBUF_STATUS_NO_QKD_CONNECTION,
+                    detail="missing stream id",
+                )
+            self._close_protobuf_stream(stream_id)
+            return self._encode_protobuf_response(status=PROTOBUF_STATUS_SUCCESS)
+
+        stream_id = request.get("stream_id", b"")
+        source = request.get("source", "")
+        destination = request.get("destination", "")
+        if not stream_id and source and destination:
+            stream_id = self._build_protobuf_stream_id(source, destination)
+        if not stream_id:
+            return self._encode_protobuf_response(
+                status=PROTOBUF_STATUS_NO_QKD_CONNECTION,
+                detail="cannot determine stream id",
+            )
+
+        index = int(request.get("index", 0))
+        key_size = int(request.get("key_size", 32))
+        if key_size <= 0:
+            return self._encode_protobuf_response(
+                status=PROTOBUF_STATUS_METADATA_BUFFER_TOO_SMALL,
+                stream_id=stream_id,
+                detail="invalid key size",
+            )
+
+        if source and destination:
+            with self._lock:
+                self._protobuf_stream_pairs[stream_id] = (source, destination)
+
+        try:
+            key_material = self._get_or_fetch_protobuf_key(stream_id, index, key_size)
+        except TimeoutError as exc:
+            return self._encode_protobuf_response(
+                status=PROTOBUF_STATUS_TIMEOUT_ERROR,
+                stream_id=stream_id,
+                index=index,
+                detail=str(exc),
+            )
+        except Exception as exc:
+            LOGGER.exception(
+                "Protobuf key retrieval failed stream_id=%s index=%d size=%d",
+                stream_id.hex(),
+                index,
+                key_size,
+            )
+            return self._encode_protobuf_response(
+                status=PROTOBUF_STATUS_NO_QKD_CONNECTION,
+                stream_id=stream_id,
+                index=index,
+                detail=f"key retrieval failed: {exc}",
+            )
+
+        return self._encode_protobuf_response(
+            status=PROTOBUF_STATUS_SUCCESS,
+            stream_id=stream_id,
+            index=index,
+            key_material=key_material,
+            source=source,
+            destination=destination,
+        )
+
+    def _build_protobuf_stream_id(self, source: str, destination: str) -> bytes:
+        first, second = sorted((source, destination))
+        material = f"{first}|{second}".encode("utf-8")
+        return hashlib.sha256(material).digest()[:16]
+
+    def _close_protobuf_stream(self, stream_id: bytes) -> None:
+        with self._lock:
+            self._protobuf_stream_pairs.pop(stream_id, None)
+            to_delete = [
+                cache_key for cache_key in self._protobuf_key_cache if cache_key[0] == stream_id
+            ]
+            for cache_key in to_delete:
+                self._protobuf_key_cache.pop(cache_key, None)
+
+    def _get_or_fetch_protobuf_key(
+        self, stream_id: bytes, index: int, key_size: int
+    ) -> bytes:
+        cache_key = (stream_id, index, key_size)
+        with self._lock:
+            cached = self._protobuf_key_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        key_material = get_key(key_size)
+        with self._lock:
+            existing = self._protobuf_key_cache.get(cache_key)
+            if existing is not None:
+                return existing
+            self._protobuf_key_cache[cache_key] = key_material
+        return key_material
+
+    def _decode_protobuf_request(self, raw_message: bytes) -> dict[str, Any]:
+        outer = _pb_parse_message(raw_message)
+        embedded_fields: list[tuple[int, bytes]] = []
+        for field_number, values in outer.items():
+            for wire_type, value in values:
+                if wire_type == "bytes":
+                    embedded_fields.append((field_number, bytes(value)))
+
+        if not embedded_fields:
+            raise ValueError("no embedded protobuf message found")
+
+        # Prefer field 1 because it is the one observed in wire capture.
+        embedded_fields.sort(key=lambda entry: (entry[0] != 1, entry[0]))
+        field_number, payload = embedded_fields[0]
+        inner = _pb_parse_message(payload)
+
+        if field_number == 3:
+            stream_id = _pb_first_bytes(inner, 1, b"")
+            return {"kind": "close", "stream_id": stream_id}
+
+        if field_number == 2:
+            stream_id = _pb_first_bytes(inner, 1, b"")
+            index = _pb_first_varint(inner, 2, 0)
+            key_size = _pb_first_varint(inner, 3, 32)
+            return {
+                "kind": "get",
+                "stream_id": stream_id,
+                "index": index,
+                "key_size": key_size,
+            }
+
+        source = _pb_first_string(inner, 1, "")
+        destination = _pb_first_string(inner, 2, "")
+        first_varint = _pb_first_varint(inner, 3, 0)
+        second_varint = _pb_first_varint(inner, 4, 0)
+        stream_id = _pb_first_bytes(inner, 5, b"")
+
+        key_size = second_varint if second_varint > 0 else first_varint
+        if key_size <= 0:
+            key_size = 32
+        index = first_varint if second_varint > 0 else 0
+
+        if not stream_id and source and destination:
+            stream_id = self._build_protobuf_stream_id(source, destination)
+
+        return {
+            "kind": "open_get",
+            "source": source,
+            "destination": destination,
+            "stream_id": stream_id,
+            "index": index,
+            "key_size": key_size,
+        }
+
+    def _encode_protobuf_response(
+        self,
+        status: int,
+        stream_id: bytes = b"",
+        index: int = 0,
+        key_material: bytes = b"",
+        source: str = "",
+        destination: str = "",
+        detail: str = "",
+    ) -> bytes:
+        # Field 1: open-like response payload (status, stream id, key, peer ids).
+        open_payload = bytearray()
+        open_payload.extend(_pb_encode_field_varint(1, status))
+        if stream_id:
+            open_payload.extend(_pb_encode_field_bytes(2, stream_id))
+        open_payload.extend(_pb_encode_field_varint(3, index))
+        if key_material:
+            open_payload.extend(_pb_encode_field_bytes(4, key_material))
+        if source:
+            open_payload.extend(_pb_encode_field_bytes(6, source.encode("utf-8")))
+        if destination:
+            open_payload.extend(_pb_encode_field_bytes(7, destination.encode("utf-8")))
+        if detail:
+            open_payload.extend(_pb_encode_field_bytes(15, detail.encode("utf-8")))
+
+        # Field 2: get-key-like response payload (status, index, key, stream id).
+        get_payload = bytearray()
+        get_payload.extend(_pb_encode_field_varint(1, status))
+        get_payload.extend(_pb_encode_field_varint(2, index))
+        if key_material:
+            get_payload.extend(_pb_encode_field_bytes(3, key_material))
+        if stream_id:
+            get_payload.extend(_pb_encode_field_bytes(4, stream_id))
+        if detail:
+            get_payload.extend(_pb_encode_field_bytes(15, detail.encode("utf-8")))
+
+        response = bytearray()
+        response.extend(_pb_encode_field_bytes(1, bytes(open_payload)))
+        response.extend(_pb_encode_field_bytes(2, bytes(get_payload)))
+        response.extend(_pb_encode_field_varint(15, status))
+        if stream_id:
+            response.extend(_pb_encode_field_bytes(16, stream_id))
+        if key_material:
+            response.extend(_pb_encode_field_bytes(17, key_material))
+        if detail:
+            response.extend(_pb_encode_field_bytes(18, detail.encode("utf-8")))
+
+        return bytes(response)
 
     def _dispatch(self, message: RequestType) -> ResponseType:
         if isinstance(message, QKDOpenRequest):
@@ -267,14 +596,79 @@ class QKDProxyTCPHandler(socketserver.StreamRequestHandler):
         client = f"{self.client_address[0]}:{self.client_address[1]}"
         LOGGER.info("Connection from %s", client)
 
-        for raw_line in self.rfile:
-            raw_message = raw_line.decode("utf-8").strip()
-            if not raw_message:
-                continue
+        mode: Optional[str] = None
+        buffer = b""
+        sock = self.connection
+        sock.settimeout(0.5)
 
-            response = self.service.handle_raw_message(raw_message)
-            self.wfile.write((response + "\n").encode("utf-8"))
-            self.wfile.flush()
+        try:
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    if mode == "binary" and buffer:
+                        break
+                    continue
+
+                if not chunk:
+                    break
+                buffer += chunk
+
+                if mode is None:
+                    mode = "json" if _looks_like_json_stream(buffer) else "binary"
+                    if mode == "json":
+                        sock.settimeout(None)
+
+                if mode == "json":
+                    while b"\n" in buffer:
+                        line_bytes, buffer = buffer.split(b"\n", 1)
+                        if not line_bytes.strip():
+                            continue
+
+                        try:
+                            raw_message = line_bytes.decode("utf-8").strip()
+                        except UnicodeDecodeError:
+                            raw_message = "{"
+
+                        response = self.service.handle_raw_message(raw_message)
+                        try:
+                            sock.sendall((response + "\n").encode("utf-8"))
+                        except BrokenPipeError:
+                            LOGGER.warning(
+                                "Client %s closed connection before reading JSON response",
+                                client,
+                            )
+                            return
+        except ConnectionResetError:
+            LOGGER.info("Connection reset by %s", client)
+            return
+
+        if mode == "json":
+            if buffer.strip():
+                try:
+                    trailing_message = buffer.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    trailing_message = "{"
+                response = self.service.handle_raw_message(trailing_message)
+                try:
+                    sock.sendall((response + "\n").encode("utf-8"))
+                except BrokenPipeError:
+                    LOGGER.warning(
+                        "Client %s closed connection before reading trailing JSON response",
+                        client,
+                    )
+            LOGGER.info("Connection closed for %s", client)
+            return
+
+        if buffer:
+            response = self.service.handle_raw_binary_message(buffer)
+            try:
+                sock.sendall(response)
+            except BrokenPipeError:
+                LOGGER.warning(
+                    "Client %s closed connection before reading protobuf response",
+                    client,
+                )
 
         LOGGER.info("Connection closed for %s", client)
 

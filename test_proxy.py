@@ -3,7 +3,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from proxy import QKDProxyService
+from proxy import QKDProxyService, _pb_parse_message
 from qkd004_messages import (
     Destination,
     QoS,
@@ -123,6 +123,29 @@ class ProxyServiceTest(unittest.TestCase):
         )
         self.assertEqual(get_key_response.status.code, StatusCode.ERROR)
         self.assertEqual(get_key_response.key_buffer, b"")
+
+    def test_binary_protobuf_request_returns_key_response(self) -> None:
+        service = QKDProxyService()
+        request = bytes.fromhex(
+            "0a1c0a0a656e63727970746f7231120a656e63727970746f723218782040"
+        )
+
+        response_1 = service.handle_raw_binary_message(request)
+        response_2 = service.handle_raw_binary_message(request)
+
+        parsed_1 = _pb_parse_message(response_1)
+        parsed_2 = _pb_parse_message(response_2)
+
+        self.assertIn(15, parsed_1)
+        self.assertEqual(parsed_1[15][0], ("varint", 0))
+        self.assertIn(17, parsed_1)
+
+        key_1 = parsed_1[17][0][1]
+        key_2 = parsed_2[17][0][1]
+        assert isinstance(key_1, bytes)
+        assert isinstance(key_2, bytes)
+        self.assertEqual(len(key_1), 64)
+        self.assertEqual(key_1, key_2)
 
     def test_response_instead_of_request_returns_error(self) -> None:
         service = QKDProxyService()

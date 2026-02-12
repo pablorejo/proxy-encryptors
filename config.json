@@ -1,0 +1,21 @@
+{
+    "ca-cert":"certs/account-2576-server-ca-qukaydee-com.crt",
+    "kmes":[
+        {
+            "name":"alice",
+            "url":"https://kme-1.acct-2576.etsi-qkd-api.qukaydee.com",
+            "crt":"certs/sae-1.crt",
+            "key":"certs/sae-1.key",
+            "pem":"certs/sae-1.pem"
+
+            
+        },
+        {
+            "name":"bob",
+            "url":"https://kme-2.acct-2576.etsi-qkd-api.qukaydee.com",
+            "crt":"certs/sae-2.crt",
+            "key":"certs/sae-2.key",
+            "pem":"certs/sae-2.pem"
+        }
+    ]
+}

@@ -156,6 +156,44 @@ def _looks_like_json_stream(data: bytes) -> bool:
     return probe.startswith(b"{") or probe.startswith(b"[")
 
 
+def _hex_preview(data: bytes, max_bytes: int = 256) -> str:
+    head = data[:max_bytes]
+    text = head.hex()
+    if len(data) > max_bytes:
+        return f"{text}...(+{len(data) - max_bytes} bytes)"
+    return text
+
+
+def _ascii_preview(data: bytes, max_bytes: int = 256) -> str:
+    head = data[:max_bytes]
+    preview_chars: list[str] = []
+    for byte in head:
+        if 32 <= byte <= 126:
+            preview_chars.append(chr(byte))
+        else:
+            preview_chars.append(".")
+    preview = "".join(preview_chars)
+    if len(data) > max_bytes:
+        return f"{preview}...(+{len(data) - max_bytes} bytes)"
+    return preview
+
+
+def _summarize_pb_fields(
+    fields: dict[int, list[tuple[str, int | bytes]]]
+) -> dict[int, list[str]]:
+    summary: dict[int, list[str]] = {}
+    for field_number, values in fields.items():
+        items: list[str] = []
+        for wire_type, value in values:
+            if wire_type == "varint":
+                items.append(f"varint={int(value)}")
+            else:
+                assert isinstance(value, (bytes, bytearray))
+                items.append(f"bytes[{len(value)}]")
+        summary[field_number] = items
+    return summary
+
+
 @dataclass
 class Association:
     key_handle: bytes
@@ -588,6 +626,23 @@ class QKDProxyService:
 
 class QKDProxyTCPHandler(socketserver.StreamRequestHandler):
     service: Optional[QKDProxyService] = None
+    trace_wire: bool = False
+    trace_limit: int = 256
+
+    def _trace(self, message: str, *args: Any) -> None:
+        if self.trace_wire:
+            LOGGER.info("TRACE %s", message % args if args else message)
+
+    def _trace_bytes(self, prefix: str, data: bytes) -> None:
+        if not self.trace_wire:
+            return
+        LOGGER.info(
+            "TRACE %s len=%d hex=%s ascii=%s",
+            prefix,
+            len(data),
+            _hex_preview(data, self.trace_limit),
+            _ascii_preview(data, self.trace_limit),
+        )
 
     def handle(self) -> None:
         if self.service is None:
@@ -613,9 +668,11 @@ class QKDProxyTCPHandler(socketserver.StreamRequestHandler):
                 if not chunk:
                     break
                 buffer += chunk
+                self._trace_bytes("recv-chunk", chunk)
 
                 if mode is None:
                     mode = "json" if _looks_like_json_stream(buffer) else "binary"
+                    self._trace("detected-mode=%s", mode)
                     if mode == "json":
                         sock.settimeout(None)
 
@@ -630,7 +687,9 @@ class QKDProxyTCPHandler(socketserver.StreamRequestHandler):
                         except UnicodeDecodeError:
                             raw_message = "{"
 
+                        self._trace("json-request=%s", raw_message)
                         response = self.service.handle_raw_message(raw_message)
+                        self._trace("json-response=%s", response)
                         try:
                             sock.sendall((response + "\n").encode("utf-8"))
                         except BrokenPipeError:
@@ -649,7 +708,9 @@ class QKDProxyTCPHandler(socketserver.StreamRequestHandler):
                     trailing_message = buffer.decode("utf-8").strip()
                 except UnicodeDecodeError:
                     trailing_message = "{"
+                self._trace("json-trailing-request=%s", trailing_message)
                 response = self.service.handle_raw_message(trailing_message)
+                self._trace("json-trailing-response=%s", response)
                 try:
                     sock.sendall((response + "\n").encode("utf-8"))
                 except BrokenPipeError:
@@ -661,7 +722,20 @@ class QKDProxyTCPHandler(socketserver.StreamRequestHandler):
             return
 
         if buffer:
+            self._trace_bytes("binary-request", buffer)
+            try:
+                parsed_request = self.service._decode_protobuf_request(buffer)  # noqa: SLF001
+                self._trace("binary-request-parsed=%s", parsed_request)
+            except Exception as exc:
+                self._trace("binary-request-parse-error=%s", exc)
+
             response = self.service.handle_raw_binary_message(buffer)
+            self._trace_bytes("binary-response", response)
+            try:
+                response_fields = _pb_parse_message(response)
+                self._trace("binary-response-fields=%s", _summarize_pb_fields(response_fields))
+            except Exception as exc:
+                self._trace("binary-response-parse-error=%s", exc)
             try:
                 sock.sendall(response)
             except BrokenPipeError:
@@ -822,13 +896,15 @@ def _configure_etsi014_from_config(
     )
 
 
-def run_server(host: str, port: int) -> None:
+def run_server(host: str, port: int, trace_wire: bool = False, trace_limit: int = 256) -> None:
     service = QKDProxyService()
 
     class BoundHandler(QKDProxyTCPHandler):
         pass
 
     BoundHandler.service = service
+    BoundHandler.trace_wire = trace_wire
+    BoundHandler.trace_limit = trace_limit
 
     with ThreadedTCPServer((host, port), BoundHandler) as server:
         LOGGER.info("QKD004 proxy listening on %s:%d", host, port)
@@ -861,6 +937,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Nombre del KME remoto (campo 'name' en config.json). Por defecto: el otro KME.",
     )
+    parser.add_argument(
+        "--trace-wire",
+        action="store_true",
+        help="Traza payloads de red recibidos/enviados (JSON y binario) para depuración.",
+    )
+    parser.add_argument(
+        "--trace-limit",
+        type=int,
+        default=256,
+        help="Máximo de bytes a mostrar por payload en trazas.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logs")
     return parser.parse_args()
 
@@ -877,7 +964,12 @@ def main() -> None:
         local_kme_name=args.local_kme,
         remote_kme_name=args.remote_kme,
     )
-    run_server(args.host, args.port)
+    run_server(
+        args.host,
+        args.port,
+        trace_wire=args.trace_wire,
+        trace_limit=args.trace_limit,
+    )
 
 
 if __name__ == "__main__":

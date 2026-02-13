@@ -35,6 +35,7 @@ def _build_local_key_container(key_size_bytes: int) -> Any:
     """
     Build a local ETSI014-shaped response when no remote KME host is configured.
     """
+    LOGGER.info("Building local ETSI014 key container key_size_bytes=%d", key_size_bytes)
     _, _, ETSI014_KeyContainer, ETSI014_Key = _load_etsi014_types()
     raw_key = os.urandom(key_size_bytes)
     key_model = ETSI014_Key(key_ID=uuid.uuid4(), key=base64.b64encode(raw_key))
@@ -56,12 +57,14 @@ def _build_ssl_context() -> ssl.SSLContext:
     """
     insecure = _is_enabled_flag("ETSI014_INSECURE_SKIP_VERIFY", "false")
     if insecure:
+        LOGGER.warning("ETSI014 TLS verification is disabled (ETSI014_INSECURE_SKIP_VERIFY=true)")
         context = ssl._create_unverified_context()
         context.check_hostname = False
         return context
 
     ca_file = os.getenv("ETSI014_CA_CERT_FILE", "").strip() or None
     ca_path = os.getenv("ETSI014_CA_CERT_PATH", "").strip() or None
+    LOGGER.debug("ETSI014 TLS config ca_file=%s ca_path=%s", ca_file or "<unset>", ca_path or "<unset>")
     try:
         context = ssl.create_default_context(cafile=ca_file, capath=ca_path)
     except Exception as exc:
@@ -81,6 +84,11 @@ def _build_ssl_context() -> ssl.SSLContext:
     client_key_password = os.getenv("ETSI014_CLIENT_KEY_PASSWORD", "").strip() or None
 
     if client_cert_file:
+        LOGGER.debug(
+            "Loading ETSI014 client cert cert=%s key=%s",
+            client_cert_file,
+            client_key_file or "<embedded-or-missing>",
+        )
         try:
             context.load_cert_chain(
                 certfile=client_cert_file,
@@ -123,10 +131,18 @@ def _request_key_container_from_kme(key_size_bytes: int) -> Any:
     )
     endpoint_url = request_message.get_endpoint_url(host.rstrip("/"))
     body = request_message.to_json().encode("utf-8")
+    LOGGER.info(
+        "ETSI014 request endpoint=%s key_size_bytes=%d etsi_size=%d timeout_s=%s",
+        endpoint_url,
+        key_size_bytes,
+        etsi_size,
+        timeout_seconds,
+    )
 
     headers = {"Content-Type": "application/json"}
     token = os.getenv("ETSI014_AUTH_BEARER", "").strip()
     if token:
+        LOGGER.debug("ETSI014 Authorization bearer token is configured")
         headers["Authorization"] = f"Bearer {token}"
 
     request = urllib.request.Request(
@@ -144,21 +160,33 @@ def _request_key_container_from_kme(key_size_bytes: int) -> Any:
             context=ssl_context,
         ) as response:
             payload = response.read().decode("utf-8")
+            LOGGER.info(
+                "ETSI014 response http_status=%s bytes=%d",
+                getattr(response, "status", "<unknown>"),
+                len(payload.encode("utf-8")),
+            )
     except urllib.error.HTTPError as exc:
         error_payload = exc.read().decode("utf-8", errors="replace")
+        LOGGER.error("ETSI014 HTTP error status=%d payload=%s", exc.code, error_payload)
         raise RuntimeError(
             f"ETSI014 KME HTTP {exc.code}: {error_payload}"
         ) from exc
     except urllib.error.URLError as exc:
+        LOGGER.error("ETSI014 connection error: %s", exc)
         raise RuntimeError(f"ETSI014 KME connection error: {exc}") from exc
 
     try:
         response_data = json.loads(payload)
     except json.JSONDecodeError as exc:
+        LOGGER.error("ETSI014 invalid JSON response: %s", exc)
         raise RuntimeError("ETSI014 KME returned invalid JSON") from exc
 
     # Accept either a bare KeyContainer or one nested under 'key_container'
     container_data = response_data.get("key_container", response_data)
+    LOGGER.debug(
+        "ETSI014 response JSON keys=%s",
+        list(response_data.keys()) if isinstance(response_data, dict) else type(response_data).__name__,
+    )
     return ETSI014_KeyContainer.from_json(container_data)
 
 
@@ -169,6 +197,7 @@ def _extract_key_bytes(container: Any) -> bytes:
     keys = container.get_keys() if hasattr(container, "get_keys") else getattr(container, "keys", [])
     if not keys:
         raise RuntimeError("ETSI014 key container is empty")
+    LOGGER.debug("ETSI014 key container entries=%d", len(keys))
 
     first_key = keys[0]
     key_value = getattr(first_key, "key", None)
@@ -200,13 +229,20 @@ def get_key(key_size_bytes: int) -> bytes:
         raise ValueError("key_size_bytes must be > 0")
 
     allow_random_fallback = _is_enabled_flag("ETSI014_ALLOW_RANDOM_FALLBACK", "true")
+    LOGGER.info(
+        "get_key requested key_size_bytes=%d allow_random_fallback=%s",
+        key_size_bytes,
+        allow_random_fallback,
+    )
 
     try:
         host = os.getenv("ETSI014_HOST", "").strip()
         sae_id = os.getenv("ETSI014_SAE_ID", "").strip()
         if host and sae_id:
+            LOGGER.info("get_key mode=remote host=%s sae_id=%s", host, sae_id)
             container = _request_key_container_from_kme(key_size_bytes)
         else:
+            LOGGER.info("get_key mode=local-randomized-container (missing ETSI014_HOST/ETSI014_SAE_ID)")
             container = _build_local_key_container(key_size_bytes)
 
         key_material = _extract_key_bytes(container)
@@ -214,9 +250,11 @@ def get_key(key_size_bytes: int) -> bytes:
             raise RuntimeError(
                 f"ETSI014 key length mismatch: expected {key_size_bytes}, got {len(key_material)}"
             )
+        LOGGER.info("get_key success key_size_bytes=%d", len(key_material))
         return key_material
     except Exception as exc:
         if allow_random_fallback:
             LOGGER.warning("ETSI014 key retrieval failed, using random fallback: %s", exc)
             return os.urandom(key_size_bytes)
+        LOGGER.error("ETSI014 key retrieval failed without fallback: %s", exc)
         raise

@@ -3,7 +3,14 @@ import os
 import unittest
 from unittest.mock import patch
 
-from proxy import QKDProxyService, _pb_parse_message
+from proxy import (
+    QKDProxyService,
+    _pb_encode_field_bytes,
+    _pb_encode_field_varint,
+    _pb_first_bytes,
+    _pb_first_varint,
+    _pb_parse_message,
+)
 from qkd004_messages import (
     Destination,
     QoS,
@@ -126,26 +133,66 @@ class ProxyServiceTest(unittest.TestCase):
 
     def test_binary_protobuf_request_returns_key_response(self) -> None:
         service = QKDProxyService()
-        request = bytes.fromhex(
-            "0a1c0a0a656e63727970746f7231120a656e63727970746f723218782040"
+        init_payload = b"".join(
+            [
+                _pb_encode_field_bytes(1, b"encryptor1"),
+                _pb_encode_field_bytes(2, b"encryptor2"),
+                _pb_encode_field_varint(3, 120),
+                _pb_encode_field_varint(4, 64),
+            ]
         )
+        init_request = _pb_encode_field_bytes(1, init_payload)
+        init_response = service.handle_raw_binary_message(init_request)
+        init_outer = _pb_parse_message(init_response)
+        self.assertIn(1, init_outer)
+        init_inner = _pb_parse_message(_pb_first_bytes(init_outer, 1))
+        session_id = _pb_first_varint(init_inner, 1, 0)
+        init_error = _pb_first_varint(init_inner, 2, -1)
+        self.assertGreater(session_id, 0)
+        self.assertEqual(init_error, 0)
 
-        response_1 = service.handle_raw_binary_message(request)
-        response_2 = service.handle_raw_binary_message(request)
+        status_request = _pb_encode_field_bytes(2, b"")
+        status_response = service.handle_raw_binary_message(status_request)
+        status_outer = _pb_parse_message(status_response)
+        self.assertIn(2, status_outer)
+        status_inner = _pb_parse_message(_pb_first_bytes(status_outer, 2))
+        self.assertEqual(_pb_first_varint(status_inner, 1, 0), 1)
+        self.assertEqual(_pb_first_varint(status_inner, 2, -1), 0)
 
-        parsed_1 = _pb_parse_message(response_1)
-        parsed_2 = _pb_parse_message(response_2)
+        get_key_payload = b"".join(
+            [
+                _pb_encode_field_varint(1, session_id),
+                _pb_encode_field_varint(2, 0),
+            ]
+        )
+        get_key_request = _pb_encode_field_bytes(3, get_key_payload)
+        get_key_response_1 = service.handle_raw_binary_message(get_key_request)
+        get_key_response_2 = service.handle_raw_binary_message(get_key_request)
 
-        self.assertIn(15, parsed_1)
-        self.assertEqual(parsed_1[15][0], ("varint", 0))
-        self.assertIn(17, parsed_1)
+        outer_1 = _pb_parse_message(get_key_response_1)
+        outer_2 = _pb_parse_message(get_key_response_2)
+        self.assertIn(3, outer_1)
+        self.assertIn(3, outer_2)
 
-        key_1 = parsed_1[17][0][1]
-        key_2 = parsed_2[17][0][1]
-        assert isinstance(key_1, bytes)
-        assert isinstance(key_2, bytes)
+        inner_1 = _pb_parse_message(_pb_first_bytes(outer_1, 3))
+        inner_2 = _pb_parse_message(_pb_first_bytes(outer_2, 3))
+
+        self.assertEqual(_pb_first_varint(inner_1, 5, -1), 0)
+        self.assertEqual(_pb_first_varint(inner_2, 5, -1), 0)
+        self.assertEqual(_pb_first_varint(inner_1, 4, 0), 64)
+
+        key_1 = _pb_first_bytes(inner_1, 3)
+        key_2 = _pb_first_bytes(inner_2, 3)
         self.assertEqual(len(key_1), 64)
         self.assertEqual(key_1, key_2)
+
+        terminate_payload = _pb_encode_field_varint(1, session_id)
+        terminate_request = _pb_encode_field_bytes(4, terminate_payload)
+        terminate_response = service.handle_raw_binary_message(terminate_request)
+        terminate_outer = _pb_parse_message(terminate_response)
+        self.assertIn(4, terminate_outer)
+        terminate_inner = _pb_parse_message(_pb_first_bytes(terminate_outer, 4))
+        self.assertEqual(_pb_first_varint(terminate_inner, 2, -1), 0)
 
     def test_response_instead_of_request_returns_error(self) -> None:
         service = QKDProxyService()

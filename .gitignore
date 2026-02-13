@@ -1,3 +1,4 @@
 certs
 qukaydee-generate-client-certificates
 wireshark.json
+data/*

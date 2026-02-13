@@ -40,7 +40,7 @@ def main() -> int:
         description="Cliente ETSI GS QKD 004 (line-delimited JSON over TCP)"
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host del proxy ETSI004")
-    parser.add_argument("--port", type=int, default=7004, help="Puerto del proxy ETSI004")
+    parser.add_argument("--port", type=int, default=5000, help="Puerto del proxy ETSI004")
     parser.add_argument("--dest-ip", default="127.0.0.1", help="Destino para QKD_OPEN")
     parser.add_argument("--dest-port", type=int, default=9000, help="Puerto destino para QKD_OPEN")
     parser.add_argument("--key-size", type=int, default=32, help="Tamaño de clave en bytes")

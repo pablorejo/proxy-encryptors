@@ -7,6 +7,7 @@ Proxy ETSI GS QKD 004 sobre TCP que obtiene material de clave desde una KME ETSI
 Este proyecto implementa un servicio `proxy.py` que:
 
 - Escucha peticiones ETSI004 (`QKD_OPEN`, `QKD_CONNECT_*`, `QKD_GET_KEY`, `QKD_CLOSE`) en TCP con JSON delimitado por línea.
+- Escucha peticiones binarias HQS (`InitializeCommunication`, `GetStatus`, `GetKey`, `TerminateCommunication`, `GetRandomNumber`) según `HQSInterface2.proto`.
 - Traduce la obtención de clave (`QKD_GET_KEY`) a una llamada ETSI014 (`/api/v1/keys/{SAE_ID}/enc_keys`) usando mTLS.
 - Mantiene una caché por `key_handle` para poder devolver la misma clave en múltiples `QKD_GET_KEY` del mismo flujo.
 
@@ -39,9 +40,29 @@ python -m venv venv
   --config config.json \
   --local-kme alice \
   --remote-kme bob \
-  --host 127.0.0.1 \
-  --port 7004 \
+  --host 0.0.0.0 \
+  --port 5000 \
   --verbose
+```
+
+### Trazas y diagnóstico
+
+- `--verbose`: activa logs `DEBUG` (parseo, estado interno, cache-hit/miss, rutas ETSI014).
+- `--trace-wire`: además imprime payloads de red (hex/ascii) para JSON y binario HQS.
+- `--trace-limit N`: limita bytes mostrados por payload en `--trace-wire`.
+
+Ejemplo de depuración máxima:
+
+```bash
+./venv/bin/python proxy.py \
+  --config config.json \
+  --local-kme alice \
+  --remote-kme bob \
+  --host 0.0.0.0 \
+  --port 5000 \
+  --verbose \
+  --trace-wire \
+  --trace-limit 512
 ```
 
 ### Lanzar un cliente ETSI004
@@ -49,7 +70,7 @@ python -m venv venv
 ```bash
 ./venv/bin/python etsi004_client.py \
   --host 127.0.0.1 \
-  --port 7004 \
+  --port 5000 \
   --connect-mode nonblock \
   --show-raw
 ```
@@ -89,11 +110,11 @@ Ejemplo real con el cliente incluido:
 
 ```bash
 # Cliente A: abre y no cierra
-./venv/bin/python etsi004_client.py --host 127.0.0.1 --port 7004 --no-close
+./venv/bin/python etsi004_client.py --host 127.0.0.1 --port 5000 --no-close
 # salida: key_handle_b64=...
 
 # Cliente B: reutiliza el mismo handle
-./venv/bin/python etsi004_client.py --host 127.0.0.1 --port 7004 --reuse-key-handle-b64 "<key_handle_b64>"
+./venv/bin/python etsi004_client.py --host 127.0.0.1 --port 5000 --reuse-key-handle-b64 "<key_handle_b64>"
 ```
 
 Notas importantes:
